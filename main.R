@@ -1,95 +1,96 @@
-library(reticulate)
-library(mapview)
 library(here)
 
-source(here("internal", "R", "map.R"))
-source(here("internal", "R", "spatial.R"))
-source(here("internal", "R", "colour.R"))
 
-use_condaenv("CA-report")
+# Settings ---------------------------------------------------------------------
+
+# Command-line flags (see `Rscript main.R --help`), e.g.
+#   Rscript main.R --title "Example Farm" --zoom 13 --width 1600 --height 900 \
+#       --lon-offset 0.01 --lat-offset -0.005
+# Sourced interactively there are no flags, so the defaults are used.
+# Parsed first so --help and bad flags return before the heavy setup below.
+source(here("internal", "R", "cli.R"))
+opts <- parse_cli()
+
+library(reticulate)
+source(here("internal", "R", "spatial.R"))
+source(here("internal", "R", "map.R"))
+source(here("internal", "R", "colour.R"))
 source_python(here("internal", "py", "map_utils_playwright.py"))
 
-map_title <- "Client name"
 
-farm_boundary <- read_sf(Sys.glob(here("spatial", "boundary", "*.shp"))) |>
-    st_make_valid() |>
-    st_transform(4326)
+# Inputs -----------------------------------------------------------------------
 
-group_col <- names(farm_boundary)[tolower(names(farm_boundary)) == "group"]
-has_groups <- length(group_col) > 0
-groups <- if (has_groups) sort(unique(farm_boundary[[group_col[1]]])) else NULL
+farm_boundary <- read_layer("boundary")
+if (is.null(farm_boundary)) {
+    stop("No boundary shapefile found in spatial/boundary", call. = FALSE)
+}
+historical_planting <- read_layer("planting") # NULL when there is no planting layer
 
-sf_use_s2(FALSE)
-centroid <- st_centroid(st_union(farm_boundary))
-sf_use_s2(TRUE)
+# An optional "group" column (any case) gives one set of maps per group.
+# Without it, the whole farm is one area and file names get no suffix.
+group_col <- names(farm_boundary)[tolower(names(farm_boundary)) == "group"][1]
+grouped <- !is.na(group_col)
 
-coords <- st_coordinates(centroid)
-
-lon <- coords[[1, 1]] - 0
-lat <- coords[[1, 2]] - 0
-
-proposed_planting <- st_read(Sys.glob(here(
-    "spatial",
-    "planting",
-    "*.shp"
-))) |>
-    st_make_valid() |>
-    st_transform(4326)
-
-
-sf_features <- list(farm_boundary, proposed_planting)
-cols <- c(blue, yellow)
-
-legend_colors <- c(blue, yellow)
-legend_labels <- c("Farm Boundary", "Historical Planting")
-
-
-if (has_groups) {
-    jobs <= c()
-    group_data <- lapply(groups, function(g) {
-        b <- farm_boundary[farm_boundary[[group_col[1]]] == g, ]
-        c_pt <- st_centroid(st_union(b))
-        coords_g <- st_coordinates(c_pt)
-        planting_g <- st_intersection2(proposed_planting, b)
-        group_entry <- list(
-            boundary = b,
-            lon = coords_g[[1, 1]] - 0,
-            lat = coords_g[[1, 2]] - 0,
-            sf_features = list(b, planting_g)
-        )
-    })
-
-    for (i in seq_along(groups)) {
-        g <- groups[[i]]
-        safe <- str_replace_all(g, "[^a-zA-Z0-9]+", "_")
-        gd <- group_data[[i]]
-        build_and_save_map(
-            gd$sf_features,
-            gd$lon,
-            gd$lat,
-            paste0(
-                "farm_boundary_",
-                safe,
-                ".html"
-            )
-        )
-        jobs <- append(jobs, array(
-            list(
-                paste0("farm_boundary_", safe, ".html"),
-                paste0("farm_boundary_", safe, ".png"),
-                1000,
-                1000
-            )
-            )
+if (grouped) {
+    group <- farm_boundary[[group_col]]
+    if (anyNA(group)) {
+        warning(
+            sum(is.na(group)), " boundary feature(s) have no group and are left off the maps",
+            call. = FALSE
         )
     }
-    batch_map_to_image(jobs)
+    areas <- split(farm_boundary, group) # one sf per group, sorted, NA dropped
+    if (length(areas) == 0) {
+        stop("The '", group_col, "' column has no values", call. = FALSE)
+    }
+    suffixes <- paste0("_", gsub("[^A-Za-z0-9]+", "_", names(areas)))
+    clash <- suffixes %in% suffixes[duplicated(suffixes)]
+    if (any(clash)) {
+        stop(
+            "These groups would share a file name: ",
+            paste(names(areas)[clash], collapse = ", "),
+            call. = FALSE
+        )
+    }
 } else {
-    build_and_save_map(
-        sf_features,
-        lon,
-        lat,
-        "farm_boundary.html"
-    )
-    map_to_image("farm_boundary.html", "farm_boundary.png", 1000, 1000)
+    areas <- list(farm_boundary)
+    suffixes <- ""
 }
+
+
+# Maps -------------------------------------------------------------------------
+
+jobs <- list()
+for (i in seq_along(areas)) {
+    area <- areas[[i]]
+    centre <- area_centre(area, opts$lon_offset, opts$lat_offset)
+
+    jobs[[length(jobs) + 1]] <- save_map(
+        "farm_boundary", suffixes[i], list(area),
+        blue, "Farm Boundary", centre,
+        title = opts$title, zoom = opts$zoom, width = opts$width, height = opts$height
+    )
+
+    # The whole-farm map shows planting as supplied; group maps clip it to the group
+    planting <- historical_planting
+    if (grouped && !is.null(planting)) {
+        planting <- clip_planting(planting, area)
+        if (nrow(planting) == 0) {
+            message(
+                "No historical planting in group '", names(areas)[i],
+                "'; skipping its planting map"
+            )
+            planting <- NULL
+        }
+    }
+    if (!is.null(planting)) {
+        jobs[[length(jobs) + 1]] <- save_map(
+            "historical_planting", suffixes[i], list(area, planting),
+            c(blue, yellow), c("Farm Boundary", "Historical Planting"), centre,
+            title = opts$title, zoom = opts$zoom, width = opts$width, height = opts$height
+        )
+    }
+}
+
+# One browser for all screenshots; Python deletes each HTML after capturing it
+batch_map_to_image(jobs)
